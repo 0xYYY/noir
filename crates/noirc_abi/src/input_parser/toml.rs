@@ -1,5 +1,5 @@
 use super::InputValue;
-use crate::{errors::InputParserError, Abi, AbiType};
+use crate::{errors::InputParserError, Abi, AbiType, MAIN_RETURN_NAME};
 use acvm::FieldElement;
 use iter_extended::{btree_map, try_btree_map, try_vecmap, vecmap};
 use serde::{Deserialize, Serialize};
@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 
 pub(crate) fn parse_toml(
     input_string: &str,
-    abi: Abi,
+    abi: &Abi,
 ) -> Result<BTreeMap<String, InputValue>, InputParserError> {
     // Parse input.toml into a BTreeMap.
     let data: BTreeMap<String, TomlTypes> = toml::from_str(input_string)?;
@@ -16,7 +16,10 @@ pub(crate) fn parse_toml(
     // When parsing the toml map we recursively go through each field to enable struct inputs.
     // To match this map with the correct abi type we reorganize our abi by parameter name in a BTreeMap, while the struct fields
     // in the abi are already stored in a BTreeMap.
-    let abi_map = abi.to_btree_map();
+    let mut abi_map = abi.to_btree_map();
+    if let Some(return_type) = &abi.return_type {
+        abi_map.insert(MAIN_RETURN_NAME.to_owned(), return_type.to_owned());
+    }
 
     // Convert arguments to field elements.
     try_btree_map(data, |(key, value)| {
@@ -57,6 +60,8 @@ enum TomlTypes {
     ArrayNum(Vec<u64>),
     // Array of hexadecimal integers
     ArrayString(Vec<String>),
+    // Array of booleans
+    ArrayBool(Vec<bool>),
     // Struct of TomlTypes
     Table(BTreeMap<String, TomlTypes>),
 }
@@ -78,7 +83,6 @@ impl From<InputValue> for TomlTypes {
                     btree_map(map, |(key, value)| (key, TomlTypes::from(value)));
                 TomlTypes::Table(map_with_toml_types)
             }
-            InputValue::Undefined => unreachable!(),
         }
     }
 }
@@ -91,14 +95,13 @@ impl InputValue {
         let input_value = match value {
             TomlTypes::String(string) => match param_type {
                 AbiType::String { .. } => InputValue::String(string),
-                AbiType::Field | AbiType::Integer { .. } => {
-                    if string.is_empty() {
-                        InputValue::Undefined
-                    } else {
-                        InputValue::Field(parse_str_to_field(&string)?)
-                    }
+                AbiType::Field | AbiType::Integer { .. } | AbiType::Boolean => {
+                    InputValue::Field(parse_str_to_field(&string)?)
                 }
-                _ => return Err(InputParserError::AbiTypeMismatch(param_type.clone())),
+
+                AbiType::Array { .. } | AbiType::Struct { .. } => {
+                    return Err(InputParserError::AbiTypeMismatch(param_type.clone()))
+                }
             },
             TomlTypes::Integer(integer) => {
                 let new_value = FieldElement::from(i128::from(integer));
@@ -121,6 +124,18 @@ impl InputValue {
 
                 InputValue::Vec(array_elements)
             }
+            TomlTypes::ArrayBool(arr_bool) => {
+                let array_elements = vecmap(arr_bool, |elem_bool| {
+                    if elem_bool {
+                        FieldElement::one()
+                    } else {
+                        FieldElement::zero()
+                    }
+                });
+
+                InputValue::Vec(array_elements)
+            }
+
             TomlTypes::Table(table) => {
                 let fields = match param_type {
                     AbiType::Struct { fields } => fields,
@@ -147,5 +162,16 @@ fn parse_str_to_field(value: &str) -> Result<FieldElement, InputParserError> {
             .parse::<i128>()
             .map_err(|err_msg| InputParserError::ParseStr(err_msg.to_string()))
             .map(FieldElement::from)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::parse_str_to_field;
+
+    #[test]
+    fn parse_empty_str_fails() {
+        // Check that this fails appropriately rather than being treated as 0, etc.
+        assert!(parse_str_to_field("").is_err());
     }
 }
